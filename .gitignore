@@ -6,6 +6,9 @@ node_modules/
 .env.*
 !.env.example
 
+# Local Supabase CA certificates
+backend/certs/
+
 # Build output
 dist/
 build/
