@@ -3,9 +3,12 @@ import { readFile } from "node:fs/promises";
 import type { PoolClient } from "pg";
 import { pool } from "./src/config/database.js";
 
-const migrationVersion = "001_initial_schema";
-const migrationUrl = new URL("./migrations/001_initial_schema.sql", import.meta.url);
-const tables = ["users", "products", "orders", "order_items"];
+const migrations = [
+  { version: "001_initial_schema", url: new URL("./migrations/001_initial_schema.sql", import.meta.url) },
+  { version: "002_sessions", url: new URL("./migrations/002_sessions.sql", import.meta.url) },
+];
+const tables = ["users", "products", "orders", "order_items", "sessions"];
+const initialTables = ["users", "products", "orders", "order_items"];
 const advisoryLockId = 731904210;
 
 type TableSignature = {
@@ -14,7 +17,7 @@ type TableSignature = {
   indexes: unknown[];
 };
 
-async function signatures(client: PoolClient, schema: string): Promise<Record<string, TableSignature>> {
+async function signatures(client: PoolClient, schema: string, expectedTables: string[]): Promise<Record<string, TableSignature>> {
   await client.query(`SET LOCAL search_path TO ${schema}`);
   const result = await client.query(
     `SELECT c.relname AS table_name,
@@ -38,7 +41,7 @@ async function signatures(client: PoolClient, schema: string): Promise<Record<st
      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = $2 AND c.relkind = 'r' AND c.relname = ANY($1::text[])
      GROUP BY c.oid, c.relname ORDER BY c.relname`,
-    [tables, schema],
+    [expectedTables, schema],
   );
 
   const output: Record<string, TableSignature> = {};
@@ -48,23 +51,23 @@ async function signatures(client: PoolClient, schema: string): Promise<Record<st
   return output;
 }
 
-async function verifyExistingSchema(client: PoolClient, migrationSql: string): Promise<void> {
+async function verifyExistingSchema(client: PoolClient, migrationSql: string[], expectedTables: string[]): Promise<void> {
   const expectedSchema = `migration_expected_${randomUUID().replaceAll("-", "")}`;
   await client.query(`CREATE SCHEMA ${expectedSchema}`);
   try {
     await client.query(`SET LOCAL search_path TO ${expectedSchema}`);
-    await client.query(migrationSql);
+    for (const sql of migrationSql) await client.query(sql);
     await client.query("SET LOCAL search_path TO public");
-    const expected = await signatures(client, expectedSchema);
-    const actual = await signatures(client, "public");
+    const expected = await signatures(client, expectedSchema, expectedTables);
+    const actual = await signatures(client, "public", expectedTables);
     const discrepancies: string[] = [];
-    for (const table of tables) {
+    for (const table of expectedTables) {
       if (!actual[table]) discrepancies.push(`public.${table} is missing`);
       else if (JSON.stringify(actual[table]) !== JSON.stringify(expected[table])) {
         discrepancies.push(`public.${table} differs in columns, types, identity/default properties, constraints, or indexes`);
       }
     }
-    if (Object.keys(expected).length !== tables.length) discrepancies.push("migration did not produce the expected four tables");
+    if (Object.keys(expected).length !== expectedTables.length) discrepancies.push("migrations did not produce the expected tables");
     if (discrepancies.length) throw new Error(`Schema verification failed: ${discrepancies.join("; ")}`);
   } finally {
     await client.query(`DROP SCHEMA ${expectedSchema} CASCADE`);
@@ -76,7 +79,7 @@ async function main(): Promise<void> {
   if (command !== "run" && command !== "baseline" && command !== "verify") {
     throw new Error("Usage: npm run migrate -- run|baseline|verify");
   }
-  const migrationSql = await readFile(migrationUrl, "utf8");
+  const migrationSql = await Promise.all(migrations.map(({ url }) => readFile(url, "utf8")));
   const client = await pool.connect();
   let transactionOpen = false;
   try {
@@ -84,10 +87,10 @@ async function main(): Promise<void> {
     transactionOpen = true;
     await client.query("SELECT pg_advisory_xact_lock($1)", [advisoryLockId]);
     if (command === "verify") {
-      await verifyExistingSchema(client, migrationSql);
+      await verifyExistingSchema(client, migrationSql, tables);
       await client.query("ROLLBACK");
       transactionOpen = false;
-      console.log("Existing schema matches the initial migration.");
+      console.log("Existing schema matches the migration set.");
       return;
     }
     const historyTable = await client.query("SELECT to_regclass('public.schema_migrations') AS table_name");
@@ -98,18 +101,23 @@ async function main(): Promise<void> {
       )`);
     }
 
-    const recorded = await client.query("SELECT 1 FROM public.schema_migrations WHERE version = $1", [migrationVersion]);
-    if (recorded.rowCount) throw new Error(`${migrationVersion} is already recorded as applied`);
-
     if (command === "baseline") {
-      await verifyExistingSchema(client, migrationSql);
-    } else {
-      await client.query(migrationSql);
+      const initial = await client.query("SELECT 1 FROM public.schema_migrations WHERE version = $1", [migrations[0].version]);
+      if (!initial.rowCount) {
+        await verifyExistingSchema(client, migrationSql.slice(0, 1), initialTables);
+        await client.query("INSERT INTO public.schema_migrations (version) VALUES ($1)", [migrations[0].version]);
+      }
     }
-    await client.query("INSERT INTO public.schema_migrations (version) VALUES ($1)", [migrationVersion]);
+    for (const [index, migration] of migrations.entries()) {
+      const recorded = await client.query("SELECT 1 FROM public.schema_migrations WHERE version = $1", [migration.version]);
+      if (recorded.rowCount) continue;
+      if (command === "baseline" && index === 0) continue;
+      await client.query(migrationSql[index]);
+      await client.query("INSERT INTO public.schema_migrations (version) VALUES ($1)", [migration.version]);
+    }
     await client.query("COMMIT");
     transactionOpen = false;
-    console.log(command === "baseline" ? "Initial migration baseline recorded after schema verification." : "Initial migration applied and recorded.");
+    console.log(command === "baseline" ? "Existing schema baselined and pending migrations applied." : "Pending migrations applied.");
   } catch (error) {
     if (transactionOpen) await client.query("ROLLBACK");
     const e = error as { code?: string; name?: string; message?: string };
