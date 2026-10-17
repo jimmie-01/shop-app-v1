@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "vitest";
 import type { Product, ProductInput, ProductRepository } from "../src/repositories/product.repository.js";
 import { ProductNotFoundError, ProductService, createProductSchema, updateProductSchema } from "../src/services/product.service.js";
 

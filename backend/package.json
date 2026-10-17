@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "migrate": "tsx run-migration.ts",
-    "test": "node --import tsx --import ./tests/setup.ts --test tests/*.test.ts",
+    "test": "vitest run",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
     "start": "node dist/server.js"
   },
   "dependencies": {
@@ -22,7 +23,10 @@
     "@types/express": "^5.0.2",
     "@types/node": "^22.15.30",
     "@types/pg": "^8.15.4",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.3.1",
     "tsx": "^4.19.4",
-    "typescript": "~5.8.3"
+    "typescript": "~5.8.3",
+    "vitest": "^5.0.5"
   }
 }

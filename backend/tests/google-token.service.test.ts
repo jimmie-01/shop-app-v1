@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "vitest";
 import type { LoginTicket, OAuth2Client } from "google-auth-library";
 import { GoogleIdTokenVerifier, InvalidGoogleTokenError } from "../src/services/google-token.service.js";
 

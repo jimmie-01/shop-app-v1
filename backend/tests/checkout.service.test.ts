@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "vitest";
 import { CheckoutService, checkoutSchema } from "../src/services/checkout.service.js";
 import { CheckoutProductNotFoundError, InsufficientStockError, type CreatedOrder } from "../src/repositories/order.repository.js";
 
@@ -17,12 +17,22 @@ test("checkout schema accepts product IDs and quantities only", () => {
 
 test("service passes only parsed product IDs and quantities to the repository", async () => {
   let captured: unknown;
-  const service = new CheckoutService({ async checkout(userId, items) { captured = { userId, items }; return order; } });
+  const service = new CheckoutService({ async checkout(userId, items) { captured = { userId, items }; return order; }, async listForUser() { return []; } });
   const result = await service.checkout("8", { items: [{ product_id: 2, quantity: 3 }] });
   assert.equal(result.id, order.id);
   assert.equal("customer_email" in result, false);
   assert.deepEqual(captured, { userId: "8", items: [{ product_id: "2", quantity: 3 }] });
   assert.throws(() => service.checkout("8", { items: [{ product_id: "1", quantity: -1 }] }));
+});
+
+test("order history service requests only the authenticated user's orders", async () => {
+  let requestedUser = "";
+  const service = new CheckoutService({
+    async checkout() { return order; },
+    async listForUser(userId) { requestedUser = userId; return []; },
+  });
+  assert.deepEqual(await service.listForUser("user-27"), []);
+  assert.equal(requestedUser, "user-27");
 });
 
 test("repository errors distinguish deleted products and stock conflicts", () => {
@@ -31,7 +41,7 @@ test("repository errors distinguish deleted products and stock conflicts", () =>
 });
 
 test("email delivery failure does not fail a committed checkout or expose the recipient", async () => {
-  const service = new CheckoutService({ async checkout() { return order; } }, { async send() { throw new Error("mail unavailable"); } });
+  const service = new CheckoutService({ async checkout() { return order; }, async listForUser() { return []; } }, { async send() { throw new Error("mail unavailable"); } });
   const result = await service.checkout("8", { items: [{ product_id: "1", quantity: 1 }] });
   assert.deepEqual(result, { id: "3", total_amount: "12.50", status: "pending", created_at: order.created_at, items: [] });
   assert.equal("customer_email" in result, false);

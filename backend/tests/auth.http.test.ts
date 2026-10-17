@@ -1,16 +1,15 @@
 import assert from "node:assert/strict";
-import { once } from "node:events";
-import { test } from "node:test";
-import type { AddressInfo } from "node:net";
+import request from "supertest";
+import { test } from "vitest";
 import { createApp } from "../src/app-factory.js";
 import { createAuthRouter } from "../src/routes/auth.routes.js";
 import { createProductRouter } from "../src/routes/product.routes.js";
-import type { Product, ProductRepository } from "../src/repositories/product.repository.js";
+import type { ProductRepository } from "../src/repositories/product.repository.js";
 import type { AuthenticatedUser, GoogleIdentity, UserRepository } from "../src/repositories/user.repository.js";
+import type { SessionRepository } from "../src/repositories/session.repository.js";
 import { AuthService } from "../src/services/auth.service.js";
 import { InvalidGoogleTokenError, type GoogleTokenVerifier } from "../src/services/google-token.service.js";
 import { hashSessionToken } from "../src/services/session.service.js";
-import type { SessionRepository } from "../src/repositories/session.repository.js";
 
 const frontendOrigin = "http://localhost:5173";
 
@@ -23,8 +22,7 @@ function createHarness(options: { failSessionCreate?: boolean } = {}) {
     async findOrCreateFromGoogle(identity: GoogleIdentity) {
       const existingId = idByGoogleSub.get(identity.googleSub);
       if (existingId) {
-        const existing = usersById.get(existingId)!;
-        const updated = { ...existing, email: identity.email, name: identity.name };
+        const updated = { ...usersById.get(existingId)!, email: identity.email, name: identity.name };
         usersById.set(existingId, updated);
         return updated;
       }
@@ -56,10 +54,7 @@ function createHarness(options: { failSessionCreate?: boolean } = {}) {
   const products: ProductRepository = {
     async list() { return []; },
     async findById() { return null; },
-    async create(input) {
-      const now = new Date();
-      return { ...input, id: "1", price: String(input.price), created_at: now, updated_at: now };
-    },
+    async create(input) { return { ...input, id: "1", price: String(input.price), created_at: new Date(), updated_at: new Date() }; },
     async update() { return null; },
     async delete() { return false; },
   };
@@ -68,80 +63,58 @@ function createHarness(options: { failSessionCreate?: boolean } = {}) {
     authRouter: createAuthRouter(auth, true, "None"),
     productRouter: createProductRouter(products, auth),
   });
-  const server = app.listen(0, "127.0.0.1");
-  return { server, usersById, idByGoogleSub, activeSessions };
+  return { app, usersById, idByGoogleSub, activeSessions };
 }
 
-const frontendRequestHeaders = { origin: frontendOrigin };
+test("Google login verifies identity, issues an HTTP-only cookie, and revokes the server session at logout", async () => {
+  const { app } = createHarness();
+  const invalid = await request(app).post("/api/auth/google").set("Origin", frontendOrigin).send({ idToken: "invalid-token" });
+  assert.equal(invalid.status, 401);
+  const extraClaims = await request(app).post("/api/auth/google").set("Origin", frontendOrigin)
+    .send({ idToken: "valid-google-id-token", role: "shop_owner", userId: "99" });
+  assert.equal(extraClaims.status, 400);
 
-test("Google login verifies the supplied token, sets a secure session, and exposes only application user fields", async (context) => {
-  const { server } = createHarness();
-  context.after(() => server.close());
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  const base = `http://127.0.0.1:${address.port}/api`;
-
-  let response = await fetch(`${base}/auth/google`, {
-    method: "POST", headers: { "content-type": "application/json", ...frontendRequestHeaders }, body: JSON.stringify({ idToken: "invalid-token" }),
-  });
-  assert.equal(response.status, 401);
-  response = await fetch(`${base}/auth/google`, {
-    method: "POST", headers: { "content-type": "application/json", ...frontendRequestHeaders },
-    body: JSON.stringify({ idToken: "valid-google-id-token", role: "shop_owner", userId: "99" }),
-  });
-  assert.equal(response.status, 400);
-
-  response = await fetch(`${base}/auth/google`, {
-    method: "POST", headers: { "content-type": "application/json", ...frontendRequestHeaders }, body: JSON.stringify({ idToken: "valid-google-id-token" }),
-  });
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get("cache-control"), "no-store");
-  const cookie = response.headers.get("set-cookie")!;
-  assert.match(cookie, /HttpOnly/);
-  assert.match(cookie, /Secure/);
-  assert.match(cookie, /SameSite=None/);
-  assert.match(cookie, /Max-Age=604800/);
-  assert.match(cookie, /shop_session=[A-Za-z0-9_-]{43}/);
-  assert.equal(cookie.split(";")[0].split("=")[1].includes("."), false);
-  const result = await response.json() as { user: AuthenticatedUser };
+  const login = await request(app).post("/api/auth/google").set("Origin", frontendOrigin).send({ idToken: "valid-google-id-token" });
+  assert.equal(login.status, 200);
+  assert.equal(login.headers["cache-control"], "no-store");
+  const cookieHeader = login.headers["set-cookie"][0] as string;
+  assert.match(cookieHeader, /HttpOnly/);
+  assert.match(cookieHeader, /Secure/);
+  assert.match(cookieHeader, /SameSite=None/);
+  assert.match(cookieHeader, /Max-Age=604800/);
+  assert.match(cookieHeader, /shop_session=[A-Za-z0-9_-]{43}/);
+  const cookie = cookieHeader.split(";")[0];
+  const result = login.body as { user: AuthenticatedUser };
   assert.deepEqual(result.user, { id: "1", email: "verified@example.test", name: "Verified Person", role: "shopper" });
   assert.equal("google_sub" in result.user, false);
 
-  response = await fetch(`${base}/auth/me`, { headers: { cookie: cookie.split(";")[0] } });
-  assert.equal(response.status, 200);
-  assert.equal((await response.json() as { user: AuthenticatedUser }).user.id, "1");
+  const current = await request(app).get("/api/auth/me").set("Cookie", cookie);
+  assert.equal(current.status, 200);
+  assert.equal(current.body.user.id, "1");
 
-  response = await fetch(`${base}/auth/logout`, { method: "POST", headers: { ...frontendRequestHeaders, cookie: cookie.split(";")[0] } });
-  assert.equal(response.status, 204);
-  assert.match(response.headers.get("set-cookie")!, /Max-Age=0/);
-  response = await fetch(`${base}/auth/me`);
-  assert.equal(response.status, 401);
-  response = await fetch(`${base}/auth/me`, { headers: { cookie: cookie.split(";")[0] } });
-  assert.equal(response.status, 401, "a copied cookie is invalid as soon as its server-side session is revoked");
+  const logout = await request(app).post("/api/auth/logout").set("Origin", frontendOrigin).set("Cookie", cookie);
+  assert.equal(logout.status, 204);
+  assert.match(logout.headers["set-cookie"][0] as string, /Max-Age=0/);
+  assert.equal((await request(app).get("/api/auth/me").set("Cookie", cookie)).status, 401,
+    "a copied cookie must fail immediately after the server session is revoked");
 });
 
-test("invalid and expired sessions are rejected, and protected product writes require a signed-in owner", async (context) => {
-  const { server, usersById, idByGoogleSub, activeSessions } = createHarness();
-  context.after(() => server.close());
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  const base = `http://127.0.0.1:${address.port}/api`;
-  const body = JSON.stringify({ name: "Mug", description: "Stoneware", price: 2, stock_quantity: 3 });
-  const postProduct = (cookie?: string, origin = frontendOrigin) => fetch(`${base}/products`, {
-    method: "POST", headers: { "content-type": "application/json", origin, ...(cookie ? { cookie } : {}) }, body,
-  });
-
-  assert.equal((await fetch(`${base}/auth/me`)).status, 401);
-  assert.equal((await fetch(`${base}/auth/me`, { headers: { cookie: "shop_session=malformed.signature" } })).status, 401);
+test("authentication rejects missing, malformed, and expired sessions", async () => {
+  const { app, activeSessions } = createHarness();
+  assert.equal((await request(app).get("/api/auth/me")).status, 401);
+  assert.equal((await request(app).get("/api/auth/me").set("Cookie", "shop_session=malformed.signature")).status, 401);
   activeSessions.set(hashSessionToken("expired-session-token"), { userId: "1", expiresAt: new Date(0) });
-  assert.equal((await fetch(`${base}/auth/me`, { headers: { cookie: "shop_session=expired-session-token" } })).status, 401);
-  assert.equal((await postProduct()).status, 401);
+  assert.equal((await request(app).get("/api/auth/me").set("Cookie", "shop_session=expired-session-token")).status, 401);
+});
 
-  const loginResponse = await fetch(`${base}/auth/google`, {
-    method: "POST", headers: { "content-type": "application/json", ...frontendRequestHeaders }, body: JSON.stringify({ idToken: "valid-google-id-token" }),
-  });
-  const shopperCookie = loginResponse.headers.get("set-cookie")!.split(";")[0];
-  assert.equal((await postProduct(shopperCookie)).status, 403);
+test("authorization blocks shoppers and rechecks the current role before owner operations", async () => {
+  const { app, usersById, idByGoogleSub, activeSessions } = createHarness();
+  const payload = { name: "Mug", description: "Stoneware", price: 2, stock_quantity: 3 };
+  assert.equal((await request(app).post("/api/products").set("Origin", frontendOrigin).send(payload)).status, 401);
+
+  const login = await request(app).post("/api/auth/google").set("Origin", frontendOrigin).send({ idToken: "valid-google-id-token" });
+  const shopperCookie = (login.headers["set-cookie"][0] as string).split(";")[0];
+  assert.equal((await request(app).post("/api/products").set("Origin", frontendOrigin).set("Cookie", shopperCookie).send(payload)).status, 403);
 
   const owner = { id: "3", email: "owner@example.test", name: "Owner", role: "shop_owner" as const };
   usersById.set(owner.id, owner);
@@ -149,49 +122,26 @@ test("invalid and expired sessions are rejected, and protected product writes re
   const ownerToken = "owner-session-token";
   activeSessions.set(hashSessionToken(ownerToken), { userId: owner.id, expiresAt: new Date(Date.now() + 60_000) });
   const ownerCookie = `shop_session=${ownerToken}`;
-  const created = await postProduct(ownerCookie);
+  const created = await request(app).post("/api/products").set("Origin", frontendOrigin).set("Cookie", ownerCookie).send(payload);
   assert.equal(created.status, 201);
   usersById.set(owner.id, { ...owner, role: "shopper" });
-  assert.equal((await postProduct(ownerCookie)).status, 403, "the current role is loaded from the user record on every request");
+  assert.equal((await request(app).post("/api/products").set("Origin", frontendOrigin).set("Cookie", ownerCookie).send(payload)).status, 403);
 });
 
-test("CORS permits credentialed frontend requests only from the configured origin", async (context) => {
-  const { server } = createHarness();
-  context.after(() => server.close());
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  const base = `http://127.0.0.1:${address.port}/api/auth/me`;
-  const allowed = await fetch(base, { headers: { origin: frontendOrigin } });
-  assert.equal(allowed.headers.get("access-control-allow-origin"), frontendOrigin);
-  assert.equal(allowed.headers.get("access-control-allow-credentials"), "true");
-  const denied = await fetch(base, { headers: { origin: "https://attacker.invalid" } });
-  assert.equal(denied.status, 403);
+test("credentialed CORS and state-changing requests are restricted to the configured origin", async () => {
+  const { app } = createHarness();
+  const allowed = await request(app).get("/api/auth/me").set("Origin", frontendOrigin);
+  assert.equal(allowed.headers["access-control-allow-origin"], frontendOrigin);
+  assert.equal(allowed.headers["access-control-allow-credentials"], "true");
+  assert.equal((await request(app).get("/api/auth/me").set("Origin", "https://attacker.invalid")).status, 403);
+  assert.equal((await request(app).post("/api/auth/logout")).status, 403);
+  assert.equal((await request(app).post("/api/auth/logout").set("Origin", "https://attacker.invalid")).status, 403);
 });
 
-test("state-changing requests require the configured Origin, including logout", async (context) => {
-  const { server } = createHarness();
-  context.after(() => server.close());
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  const base = `http://127.0.0.1:${address.port}/api`;
-  const body = JSON.stringify({ idToken: "valid-google-id-token" });
-  const noOrigin = await fetch(`${base}/auth/google`, { method: "POST", headers: { "content-type": "application/json" }, body });
-  assert.equal(noOrigin.status, 403);
-  const hostileOrigin = await fetch(`${base}/auth/logout`, { method: "POST", headers: { origin: "https://attacker.invalid" } });
-  assert.equal(hostileOrigin.status, 403);
-});
-
-test("login does not issue a cookie when the session store fails", async (context) => {
-  const { server } = createHarness({ failSessionCreate: true });
-  context.after(() => server.close());
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  const response = await fetch(`http://127.0.0.1:${address.port}/api/auth/google`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...frontendRequestHeaders },
-    body: JSON.stringify({ idToken: "valid-google-id-token" }),
-  });
+test("login does not issue a cookie when session persistence fails", async () => {
+  const { app } = createHarness({ failSessionCreate: true });
+  const response = await request(app).post("/api/auth/google").set("Origin", frontendOrigin).send({ idToken: "valid-google-id-token" });
   assert.equal(response.status, 500);
-  assert.equal(response.headers.get("set-cookie"), null);
-  assert.deepEqual(await response.json(), { error: "Internal server error" });
+  assert.equal(response.headers["set-cookie"], undefined);
+  assert.deepEqual(response.body, { error: "Internal server error" });
 });
